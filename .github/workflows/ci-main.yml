@@ -1,0 +1,10 @@
+name: CI Main - RoboShop Payment
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  cicd:
+    uses: wmp-nk-v1/github-reusable-workflows/.github/workflows/cicd-m.yml@main

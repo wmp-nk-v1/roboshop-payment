@@ -1,0 +1,9 @@
+name: CI Branch - RoboShop Payment
+on:
+  push:
+    branches-ignore:
+      - main
+
+jobs:
+  cicd:
+    uses: wmp-nk-v1/github-reusable-workflows/.github/workflows/ci-b.yml@main
