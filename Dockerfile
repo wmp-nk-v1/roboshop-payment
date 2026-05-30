@@ -6,4 +6,7 @@ COPY requirements.txt .
 RUN python3.12 -m pip install --no-cache-dir -r requirements.txt
 COPY . .
 EXPOSE 8080
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["python3.12", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
