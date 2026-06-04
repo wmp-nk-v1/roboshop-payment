@@ -5,13 +5,25 @@ import time
 import logging
 import pika
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("payment")
 
 app = FastAPI(title="RoboShop Payment Service")
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    logger.info(json.dumps({
+        "method": request.method,
+        "path": request.url.path,
+        "status": response.status_code,
+        "latency_ms": round((time.time() - start) * 1000, 3)
+    }))
+    return response
 
 AMQP_HOST = os.getenv("AMQP_HOST", "rabbitmq")
 AMQP_USER = os.getenv("AMQP_USER", "guest")
