@@ -3,7 +3,7 @@ import json
 import uuid
 import time
 import logging
-import pika
+import aio_pika
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
@@ -28,34 +28,29 @@ async def log_requests(request: Request, call_next):
 AMQP_HOST = os.getenv("AMQP_HOST", "rabbitmq")
 AMQP_USER = os.getenv("AMQP_USER", "guest")
 AMQP_PASS = os.getenv("AMQP_PASS", "guest")
-CART_URL = os.getenv("CART_URL", "http://cart:8003")
-USER_URL = os.getenv("USER_URL", "http://user:8001")
+CART_URL  = os.getenv("CART_URL", "http://cart:8003")
+USER_URL  = os.getenv("USER_URL", "http://user:8001")
 
-EXCHANGE = "roboshop"
+EXCHANGE    = "roboshop"
 ROUTING_KEY = "orders"
 
-rabbitmq_connection = None
-rabbitmq_channel = None
+_amqp_connection = None
+_amqp_channel    = None
 
 
-def connect_rabbitmq():
-    global rabbitmq_connection, rabbitmq_channel
-    credentials = pika.PlainCredentials(AMQP_USER, AMQP_PASS)
-    for i in range(30):
-        try:
-            rabbitmq_connection = pika.BlockingConnection(
-                pika.ConnectionParameters(host=AMQP_HOST, credentials=credentials)
-            )
-            rabbitmq_channel = rabbitmq_connection.channel()
-            rabbitmq_channel.exchange_declare(exchange=EXCHANGE, exchange_type="direct", durable=True)
-            rabbitmq_channel.queue_declare(queue="orders", durable=True)
-            rabbitmq_channel.queue_bind(queue="orders", exchange=EXCHANGE, routing_key=ROUTING_KEY)
-            logger.info("Connected to RabbitMQ")
-            return
-        except Exception as e:
-            logger.warning(f"RabbitMQ connection attempt {i+1}/30 failed: {e}")
-            time.sleep(2)
-    raise Exception("Failed to connect to RabbitMQ")
+async def get_amqp_channel():
+    global _amqp_connection, _amqp_channel
+    if _amqp_connection is None or _amqp_connection.is_closed:
+        _amqp_connection = await aio_pika.connect_robust(
+            host=AMQP_HOST, login=AMQP_USER, password=AMQP_PASS
+        )
+        _amqp_channel = await _amqp_connection.channel()
+        await _amqp_channel.declare_exchange(EXCHANGE, aio_pika.ExchangeType.DIRECT, durable=True)
+        queue = await _amqp_channel.declare_queue("orders", durable=True)
+        exchange = await _amqp_channel.get_exchange(EXCHANGE)
+        await queue.bind(exchange, ROUTING_KEY)
+        logger.info("Connected to RabbitMQ")
+    return _amqp_channel
 
 
 class PaymentRequest(BaseModel):
@@ -65,7 +60,20 @@ class PaymentRequest(BaseModel):
 
 @app.on_event("startup")
 async def startup():
-    connect_rabbitmq()
+    for attempt in range(30):
+        try:
+            await get_amqp_channel()
+            return
+        except Exception as e:
+            logger.warning(f"RabbitMQ connection attempt {attempt+1}/30 failed: {e}")
+            await __import__("asyncio").sleep(2)
+    raise Exception("Failed to connect to RabbitMQ")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if _amqp_connection and not _amqp_connection.is_closed:
+        await _amqp_connection.close()
 
 
 @app.get("/health")
@@ -75,7 +83,6 @@ def health():
 
 @app.post("/payment/process")
 async def process_payment(request: PaymentRequest):
-    # Validate user
     async with httpx.AsyncClient() as client:
         try:
             user_resp = await client.get(f"{USER_URL}/validate/{request.userId}")
@@ -85,7 +92,6 @@ async def process_payment(request: PaymentRequest):
         except httpx.RequestError:
             raise HTTPException(status_code=503, detail="User service unavailable")
 
-        # Get cart
         try:
             cart_resp = await client.get(f"{CART_URL}/cart/{request.userId}")
             if cart_resp.status_code != 200:
@@ -97,42 +103,35 @@ async def process_payment(request: PaymentRequest):
     if not cart.get("items"):
         raise HTTPException(status_code=400, detail="Cart is empty")
 
-    # Mock payment processing
-    total = sum(item["price"] * item["quantity"] for item in cart["items"])
+    total          = sum(item["price"] * item["quantity"] for item in cart["items"])
     transaction_id = f"TXN-{uuid.uuid4().hex[:8].upper()}"
 
-    # Build order event
     order_event = {
-        "userId": request.userId,
-        "userEmail": user.get("email", ""),
-        "userName": user.get("firstName", "Customer"),
-        "items": cart["items"],
-        "total": total,
-        "cityId": request.cityId,
+        "userId":        request.userId,
+        "userEmail":     user.get("email", ""),
+        "userName":      user.get("firstName", "Customer"),
+        "items":         cart["items"],
+        "total":         total,
+        "cityId":        request.cityId,
         "transactionId": transaction_id,
-        "status": "PAID",
+        "status":        "PAID",
     }
 
-    # Publish to RabbitMQ
     try:
-        rabbitmq_channel.basic_publish(
-            exchange=EXCHANGE,
+        channel  = await get_amqp_channel()
+        exchange = await channel.get_exchange(EXCHANGE)
+        await exchange.publish(
+            aio_pika.Message(
+                body=json.dumps(order_event).encode(),
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            ),
             routing_key=ROUTING_KEY,
-            body=json.dumps(order_event),
-            properties=pika.BasicProperties(delivery_mode=2),
         )
         logger.info(f"Payment processed: {transaction_id} for user {request.userId}")
     except Exception as e:
         logger.error(f"Failed to publish order event: {e}")
-        connect_rabbitmq()
-        rabbitmq_channel.basic_publish(
-            exchange=EXCHANGE,
-            routing_key=ROUTING_KEY,
-            body=json.dumps(order_event),
-            properties=pika.BasicProperties(delivery_mode=2),
-        )
+        raise HTTPException(status_code=503, detail="Order event failed — please retry")
 
-    # Clear cart after payment
     async with httpx.AsyncClient() as client:
         try:
             await client.delete(f"{CART_URL}/cart/{request.userId}")
@@ -140,7 +139,7 @@ async def process_payment(request: PaymentRequest):
             logger.warning("Failed to clear cart after payment")
 
     return {
-        "status": "SUCCESS",
+        "status":        "SUCCESS",
         "transactionId": transaction_id,
-        "total": total,
+        "total":         total,
     }
