@@ -83,7 +83,7 @@ def health():
 
 @app.post("/payment/process")
 async def process_payment(request: PaymentRequest):
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             user_resp = await client.get(f"{USER_URL}/validate/{request.userId}")
             if user_resp.status_code != 200:
@@ -132,7 +132,7 @@ async def process_payment(request: PaymentRequest):
         logger.error(f"Failed to publish order event: {e}")
         raise HTTPException(status_code=503, detail="Order event failed — please retry")
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             await client.delete(f"{CART_URL}/cart/{request.userId}")
         except Exception:
